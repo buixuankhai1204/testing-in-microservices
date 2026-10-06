@@ -1,6 +1,7 @@
-//! End-to-end tests against a fully deployed environment (real orders service, payments service
-//! and database), going through the public entry point only. They're slow and need
-//! infrastructure, so they're ignored by default and meant for a late pipeline stage:
+//! End-to-end tests against a fully deployed environment (real orders, events and payments
+//! services, message bus and database), going through the public entry point only. They're
+//! slow and need infrastructure, so they're ignored by default and meant for a late pipeline
+//! stage:
 //!
 //! ```text
 //! E2E_BASE_URL=https://staging.example.com cargo test --test e2e -- --ignored
@@ -18,8 +19,8 @@ fn base_url() -> String {
         .to_string()
 }
 
-/// Retries `check` until it returns Some, or panics after `timeout`. Downstream steps like
-/// payment capture can finish asynchronously in a real environment.
+/// Retries `check` until it returns Some, or panics after `timeout`. The order is only PENDING
+/// when we get the 201 back, the seat and payment steps of the saga finish afterwards.
 async fn eventually<T, F, Fut>(timeout: Duration, mut check: F) -> T
 where
     F: FnMut() -> Fut,

@@ -50,6 +50,7 @@ impl Item {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderStatus {
     Pending,
+    SeatReserved,
     Confirmed,
     Shipped,
     Cancelled,
@@ -59,6 +60,7 @@ impl OrderStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             OrderStatus::Pending => "PENDING",
+            OrderStatus::SeatReserved => "SEAT_RESERVED",
             OrderStatus::Confirmed => "CONFIRMED",
             OrderStatus::Shipped => "SHIPPED",
             OrderStatus::Cancelled => "CANCELLED",
@@ -68,6 +70,7 @@ impl OrderStatus {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "PENDING" => Some(OrderStatus::Pending),
+            "SEAT_RESERVED" => Some(OrderStatus::SeatReserved),
             "CONFIRMED" => Some(OrderStatus::Confirmed),
             "SHIPPED" => Some(OrderStatus::Shipped),
             "CANCELLED" => Some(OrderStatus::Cancelled),
@@ -163,13 +166,29 @@ impl Order {
         self.items.iter().map(Item::subtotal).sum()
     }
 
+    /// The events service held a seat for this order.
+    pub fn reserve_seat(&mut self) -> Result<(), DomainError> {
+        self.require(OrderStatus::Pending, "reserve a seat for")?;
+        self.status = OrderStatus::SeatReserved;
+        Ok(())
+    }
+
+    /// Payment came through. Only makes sense once the seat is held.
     pub fn confirm(&mut self, payment_id: impl Into<String>) -> Result<(), DomainError> {
         if self.items.is_empty() {
             return Err(DomainError::EmptyOrder);
         }
-        self.require(OrderStatus::Pending, "confirm")?;
+        self.require(OrderStatus::SeatReserved, "confirm")?;
         self.status = OrderStatus::Confirmed;
         self.payment_id = Some(payment_id.into());
+        Ok(())
+    }
+
+    /// Payment was declined, so the order is dead. The seat is released by whoever reacts to
+    /// the order being cancelled.
+    pub fn decline_payment(&mut self) -> Result<(), DomainError> {
+        self.require(OrderStatus::SeatReserved, "decline payment for")?;
+        self.status = OrderStatus::Cancelled;
         Ok(())
     }
 
@@ -181,7 +200,7 @@ impl Order {
 
     pub fn cancel(&mut self) -> Result<(), DomainError> {
         match self.status {
-            OrderStatus::Pending | OrderStatus::Confirmed => {
+            OrderStatus::Pending | OrderStatus::SeatReserved | OrderStatus::Confirmed => {
                 self.status = OrderStatus::Cancelled;
                 Ok(())
             }
@@ -214,6 +233,12 @@ mod tests {
         order
     }
 
+    fn order_with_seat() -> Order {
+        let mut order = order_with_book();
+        order.reserve_seat().unwrap();
+        order
+    }
+
     #[test]
     fn total_is_sum_of_line_items() {
         let mut order = Order::new("c-42");
@@ -239,8 +264,42 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_order_records_payment_id() {
+    fn reserving_a_seat_moves_a_pending_order_forward() {
         let mut order = order_with_book();
+        order.reserve_seat().unwrap();
+
+        assert_eq!(order.status(), OrderStatus::SeatReserved);
+    }
+
+    #[test]
+    fn cannot_reserve_a_seat_twice() {
+        let mut order = order_with_seat();
+
+        assert_eq!(
+            order.reserve_seat(),
+            Err(DomainError::InvalidTransition {
+                action: "reserve a seat for",
+                status: OrderStatus::SeatReserved
+            })
+        );
+    }
+
+    #[test]
+    fn cannot_confirm_before_the_seat_is_reserved() {
+        let mut order = order_with_book();
+
+        assert_eq!(
+            order.confirm("p-1"),
+            Err(DomainError::InvalidTransition {
+                action: "confirm",
+                status: OrderStatus::Pending
+            })
+        );
+    }
+
+    #[test]
+    fn confirmed_order_records_payment_id() {
+        let mut order = order_with_seat();
         order.confirm("p-1").unwrap();
 
         assert_eq!(order.status(), OrderStatus::Confirmed);
@@ -248,8 +307,26 @@ mod tests {
     }
 
     #[test]
+    fn declined_payment_cancels_an_order_that_holds_a_seat() {
+        let mut order = order_with_seat();
+        order.decline_payment().unwrap();
+
+        assert_eq!(order.status(), OrderStatus::Cancelled);
+        assert_eq!(order.payment_id(), None);
+    }
+
+    #[test]
+    fn declined_payment_cannot_cancel_a_confirmed_order() {
+        let mut order = order_with_seat();
+        order.confirm("p-1").unwrap();
+
+        assert!(order.decline_payment().is_err());
+        assert_eq!(order.status(), OrderStatus::Confirmed);
+    }
+
+    #[test]
     fn cannot_cancel_a_shipped_order() {
-        let mut order = order_with_book();
+        let mut order = order_with_seat();
         order.confirm("p-1").unwrap();
         order.ship().unwrap();
 
@@ -272,6 +349,7 @@ mod tests {
     fn status_round_trips_through_its_string_form() {
         for s in [
             OrderStatus::Pending,
+            OrderStatus::SeatReserved,
             OrderStatus::Confirmed,
             OrderStatus::Shipped,
             OrderStatus::Cancelled,

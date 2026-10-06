@@ -1,4 +1,5 @@
-//! HTTP routes plus the request/response types.
+//! HTTP routes plus the request/response types. Events from other services don't come in here,
+//! they arrive on Kafka (see `kafka.rs`).
 
 use crate::domain::{Item, Money, Order, OrderStatus};
 use crate::service::{OrderService, ServiceError};
@@ -84,9 +85,8 @@ impl IntoResponse for ServiceError {
     fn into_response(self) -> Response {
         let status = match &self {
             ServiceError::EmptyOrder | ServiceError::Domain(_) => StatusCode::UNPROCESSABLE_ENTITY,
-            ServiceError::PaymentDeclined => StatusCode::PAYMENT_REQUIRED,
-            ServiceError::PaymentsUnavailable(_) => StatusCode::BAD_GATEWAY,
             ServiceError::NotFound(_) => StatusCode::NOT_FOUND,
+            ServiceError::Publish(_) => StatusCode::BAD_GATEWAY,
             ServiceError::Repo(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, Json(json!({ "error": self.to_string() }))).into_response()
