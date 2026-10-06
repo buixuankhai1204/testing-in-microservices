@@ -4,107 +4,82 @@
   },
   "interactions": [
     {
-      "description": "a charge for a customer with a valid card",
+      "contents": {
+        "content": {
+          "orderId": "3f2b8c1e-5a47-4d0e-9a52-1c6f0e7d2b90",
+          "paymentId": "p-1",
+          "type": "payment_approved"
+        },
+        "contentType": "application/json",
+        "encoded": false
+      },
+      "description": "a payment was approved",
+      "matchingRules": {
+        "body": {
+          "$.orderId": {
+            "combine": "AND",
+            "matchers": [
+              {
+                "match": "type"
+              }
+            ]
+          },
+          "$.paymentId": {
+            "combine": "AND",
+            "matchers": [
+              {
+                "match": "type"
+              }
+            ]
+          }
+        }
+      },
+      "pending": false,
       "providerStates": [
         {
-          "name": "customer c-42 has a valid card"
+          "name": "an order has a seat and is waiting for payment"
         }
       ],
-      "request": {
-        "body": {
-          "amountCents": 1000,
-          "customerId": "c-42"
-        },
-        "headers": {
-          "content-type": "application/json"
-        },
-        "matchingRules": {
-          "body": {
-            "$.amountCents": {
-              "combine": "AND",
-              "matchers": [
-                {
-                  "match": "type"
-                }
-              ]
-            }
-          }
-        },
-        "method": "POST",
-        "path": "/payments"
-      },
-      "response": {
-        "body": {
-          "paymentId": "p-1",
-          "status": "APPROVED"
-        },
-        "headers": {
-          "content-type": "application/json"
-        },
-        "matchingRules": {
-          "body": {
-            "$.paymentId": {
-              "combine": "AND",
-              "matchers": [
-                {
-                  "match": "type"
-                }
-              ]
-            }
-          }
-        },
-        "status": 201
-      }
+      "type": "Asynchronous/Messages"
     },
     {
-      "description": "a charge for a customer whose card is declined",
+      "contents": {
+        "content": {
+          "orderId": "3f2b8c1e-5a47-4d0e-9a52-1c6f0e7d2b90",
+          "type": "payment_declined"
+        },
+        "contentType": "application/json",
+        "encoded": false
+      },
+      "description": "a payment was declined",
+      "matchingRules": {
+        "body": {
+          "$.orderId": {
+            "combine": "AND",
+            "matchers": [
+              {
+                "match": "type"
+              }
+            ]
+          }
+        }
+      },
+      "pending": false,
       "providerStates": [
         {
-          "name": "customer c-13 has a card that will be declined"
+          "name": "an order has a seat and is waiting for payment"
         }
       ],
-      "request": {
-        "body": {
-          "amountCents": 1000,
-          "customerId": "c-13"
-        },
-        "headers": {
-          "content-type": "application/json"
-        },
-        "matchingRules": {
-          "body": {
-            "$.amountCents": {
-              "combine": "AND",
-              "matchers": [
-                {
-                  "match": "type"
-                }
-              ]
-            }
-          }
-        },
-        "method": "POST",
-        "path": "/payments"
-      },
-      "response": {
-        "body": {
-          "status": "DECLINED"
-        },
-        "headers": {
-          "content-type": "application/json"
-        },
-        "status": 402
-      }
+      "type": "Asynchronous/Messages"
     }
   ],
   "metadata": {
     "pactRust": {
       "consumer": "1.4.10",
-      "mockserver": "2.2.5",
       "models": "1.3.15"
     },
     "pactSpecification": {
-      "version": "3.0.0"
+      "version": "4.0"
     }
   },
   "provider": {

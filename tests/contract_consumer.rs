@@ -1,73 +1,121 @@
-//! Pact consumer test: what orders-service needs from payments-service.
+//! Pact consumer tests for the events orders-service listens to. These are message pacts, so an
+//! interaction is an event another service publishes instead of a request and response.
 //!
-//! It runs `LivePaymentsClient` against a Pact mock server, so the expectations can't drift
-//! from what the client really sends, and writes the contract to
-//! `pacts/orders-service-payments-service.json`. The payments side verifies that file in
-//! `contract_provider.rs`. In a real setup it would go through a Pact Broker instead.
+//! Each test takes the example message from the pact and sends it down the same path as a real
+//! delivery (bytes -> `InboundEvent` -> `OrderService::handle`), then checks what happened to
+//! the order. Running them writes `pacts/orders-service-events-service.json` and
+//! `pacts/orders-service-payments-service.json`. The events and payments teams verify their
+//! publishers against those files, nothing in this repo does.
 
-use orders_service::domain::Money;
-use orders_service::gateway::{LivePaymentsClient, PaymentResult, PaymentsGateway};
+use async_trait::async_trait;
+use orders_service::domain::{Item, Money, Order, OrderStatus};
+use orders_service::events::{EventPublisher, InboundEvent, OutboundEvent, PublishError};
+use orders_service::repository::{InMemoryOrderRepository, OrderRepository};
+use orders_service::service::OrderService;
 use pact_consumer::prelude::*;
-use std::time::Duration;
+use serde_json::Value;
+use std::sync::Arc;
+use uuid::Uuid;
 
-fn payments_pact() -> PactBuilder {
-    // put the pact in ./pacts instead of target/pacts
-    // (set_var is safe on edition 2021)
-    std::env::set_var(
-        "PACT_OUTPUT_DIR",
-        concat!(env!("CARGO_MANIFEST_DIR"), "/pacts"),
-    );
+const PACT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/pacts");
 
-    let mut pact = PactBuilder::new("orders-service", "payments-service");
+struct NoopPublisher;
 
-    pact.interaction("a charge for a customer with a valid card", "", |mut i| {
-        i.given("customer c-42 has a valid card");
-        i.request
-            .post()
-            .path("/payments")
-            .content_type("application/json")
-            .json_body(json_pattern!({
-                "customerId": "c-42",
-                // any integer will do when verifying the provider
-                "amountCents": like!(1000)
-            }));
-        i.response.created().content_type("application/json").json_body(json_pattern!({
-            "paymentId": like!("p-1"),
-            "status": "APPROVED"
-        }));
-        i
-    });
-
-    pact.interaction("a charge for a customer whose card is declined", "", |mut i| {
-        i.given("customer c-13 has a card that will be declined");
-        i.request
-            .post()
-            .path("/payments")
-            .content_type("application/json")
-            .json_body(json_pattern!({
-                "customerId": "c-13",
-                "amountCents": like!(1000)
-            }));
-        i.response
-            .status(402)
-            .content_type("application/json")
-            .json_body(json_pattern!({ "status": "DECLINED" }));
-        i
-    });
-
-    pact
+#[async_trait]
+impl EventPublisher for NoopPublisher {
+    async fn publish(&self, _event: OutboundEvent) -> Result<(), PublishError> {
+        Ok(())
+    }
 }
 
-#[tokio::test]
-async fn client_honours_the_payments_contract() {
-    // on drop, `mock` fails the test if an expected request never came in, and writes the
-    // pact file
-    let mock = payments_pact().start_mock_server(None, None);
-    let client = LivePaymentsClient::new(mock.url().as_str(), Duration::from_secs(2));
+/// The example messages from the pact, in the order they were defined. The pact file gets
+/// written when the iterator is dropped.
+///
+/// pact needs a multi-thread runtime for this, see the `#[tokio::test]` flavor below.
+fn example_messages(pact: &PactBuilder) -> Vec<Vec<u8>> {
+    pact.messages()
+        .map(|m| m.contents.contents.value().unwrap().to_vec())
+        .collect()
+}
 
-    let approved = client.charge("c-42", Money::from_cents(10_00)).await.unwrap();
-    assert!(matches!(approved, PaymentResult::Approved { .. }));
+/// Puts an order in `status` in a fresh repo, delivers `message` and returns the order after.
+async fn deliver(message: &[u8], status: OrderStatus) -> Order {
+    // the order id comes out of the message, so the order is created to match
+    let body: Value = serde_json::from_slice(message).unwrap();
+    let order_id: Uuid = body["orderId"].as_str().unwrap().parse().unwrap();
+    let items = vec![Item {
+        sku: "book".into(),
+        qty: 1,
+        price: Money::from_cents(10_00),
+    }];
+    let repo = Arc::new(InMemoryOrderRepository::default());
+    repo.save(&Order::restore(
+        order_id,
+        "c-42".into(),
+        items,
+        status,
+        None,
+    ))
+    .await
+    .unwrap();
+    let service = OrderService::new(repo, Arc::new(NoopPublisher));
 
-    let declined = client.charge("c-13", Money::from_cents(10_00)).await.unwrap();
-    assert_eq!(declined, PaymentResult::Declined);
+    let event: InboundEvent = serde_json::from_slice(message).unwrap();
+    service.handle(event).await.unwrap();
+
+    service.get(order_id).await.unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handles_seat_reserved_from_the_events_service() {
+    let mut pact = PactBuilder::new_v4("orders-service", "events-service");
+    pact.with_output_dir(PACT_DIR).message_interaction(
+        "a seat was reserved for an order",
+        |mut i| {
+            i.given("an order is waiting for its seat");
+            i.json_body(json_pattern!({
+                "type": "seat_reserved",
+                // different on every order, only the type matters
+                "orderId": like!("3f2b8c1e-5a47-4d0e-9a52-1c6f0e7d2b90")
+            }));
+            i
+        },
+    );
+
+    let messages = example_messages(&pact);
+
+    let order = deliver(&messages[0], OrderStatus::Pending).await;
+    assert_eq!(order.status(), OrderStatus::SeatReserved);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handles_payment_results_from_the_payments_service() {
+    let mut pact = PactBuilder::new_v4("orders-service", "payments-service");
+    pact.with_output_dir(PACT_DIR)
+        .message_interaction("a payment was approved", |mut i| {
+            i.given("an order has a seat and is waiting for payment");
+            i.json_body(json_pattern!({
+                "type": "payment_approved",
+                "orderId": like!("3f2b8c1e-5a47-4d0e-9a52-1c6f0e7d2b90"),
+                "paymentId": like!("p-1")
+            }));
+            i
+        })
+        .message_interaction("a payment was declined", |mut i| {
+            i.given("an order has a seat and is waiting for payment");
+            i.json_body(json_pattern!({
+                "type": "payment_declined",
+                "orderId": like!("3f2b8c1e-5a47-4d0e-9a52-1c6f0e7d2b90")
+            }));
+            i
+        });
+
+    let messages = example_messages(&pact);
+
+    let approved = deliver(&messages[0], OrderStatus::SeatReserved).await;
+    assert_eq!(approved.status(), OrderStatus::Confirmed);
+    assert_eq!(approved.payment_id(), Some("p-1"));
+
+    let declined = deliver(&messages[1], OrderStatus::SeatReserved).await;
+    assert_eq!(declined.status(), OrderStatus::Cancelled);
 }

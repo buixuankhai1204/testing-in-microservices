@@ -1,6 +1,7 @@
 //! Component tests that start the real `orders-service` binary as a child process, configured
-//! through env vars like it would be in prod. The tests only talk to it over HTTP. Payments is
-//! a WireMock server.
+//! through env vars like it would be in prod. The tests only talk to it over HTTP. The message
+//! bus is a WireMock server that receives what we publish, and the other services' events are
+//! posted to `/events` by the test.
 //!
 //! This covers what the in-process tests can't: the `main.rs` wiring, env var config, and the
 //! binary actually starting up and serving requests.
@@ -22,14 +23,14 @@ struct ServiceProcess {
 }
 
 impl ServiceProcess {
-    async fn start(payments_url: &str) -> Self {
+    async fn start(bus_url: &str) -> Self {
         // cargo builds the binary and hands us the path
         let bin = env!("CARGO_BIN_EXE_orders-service");
         let port = free_port();
         let child = Command::new(bin)
             .env("HOST", "127.0.0.1")
             .env("PORT", port.to_string())
-            .env("PAYMENTS_URL", payments_url)
+            .env("EVENT_BUS_URL", bus_url)
             .env_remove("DATABASE_URL") // forces the in-memory repo
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -57,7 +58,10 @@ impl ServiceProcess {
                     return;
                 }
             }
-            assert!(Instant::now() < deadline, "service did not become healthy in time");
+            assert!(
+                Instant::now() < deadline,
+                "service did not become healthy in time"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
@@ -86,52 +90,143 @@ fn book_order() -> Value {
     })
 }
 
-#[tokio::test]
-async fn creates_and_fetches_an_order_through_the_real_binary() {
-    let payments = MockServer::start().await;
+/// a bus that accepts everything
+async fn accepting_bus() -> MockServer {
+    let bus = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/payments"))
-        .respond_with(
-            ResponseTemplate::new(201)
-                .set_body_json(json!({ "paymentId": "p-1", "status": "APPROVED" })),
-        )
-        .expect(1) // checked when the MockServer drops
-        .mount(&payments)
+        .and(path("/events"))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(&bus)
         .await;
-    let service = ServiceProcess::start(&payments.uri()).await;
-    let http = reqwest::Client::new();
+    bus
+}
 
-    let created = http
-        .post(format!("{}/orders", service.base))
-        .json(&book_order())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(created.status(), 201);
-    let created: Value = created.json().await.unwrap();
-    assert_eq!(created["status"], "CONFIRMED");
-
-    let id = created["id"].as_str().unwrap();
-    let fetched: Value = http
-        .get(format!("{}/orders/{id}", service.base))
-        .send()
+/// `type` of every event the service has published to the bus so far
+async fn published_types(bus: &MockServer) -> Vec<String> {
+    bus.received_requests()
         .await
         .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(fetched, created);
+        .iter()
+        .map(|r| {
+            r.body_json::<Value>().unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect()
+}
+
+struct Client {
+    http: reqwest::Client,
+    base: String,
+}
+
+impl Client {
+    fn new(service: &ServiceProcess) -> Self {
+        Client {
+            http: reqwest::Client::new(),
+            base: service.base.clone(),
+        }
+    }
+
+    async fn place_order(&self) -> String {
+        let res = self
+            .http
+            .post(format!("{}/orders", self.base))
+            .json(&book_order())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 201);
+        let created: Value = res.json().await.unwrap();
+        created["id"].as_str().unwrap().to_string()
+    }
+
+    /// what the bus does when another service publishes something
+    async fn deliver(&self, event: Value) -> u16 {
+        self.http
+            .post(format!("{}/events", self.base))
+            .json(&event)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    async fn order(&self, id: &str) -> Value {
+        self.http
+            .get(format!("{}/orders/{id}", self.base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
 }
 
 #[tokio::test]
-async fn returns_502_when_the_payments_service_is_failing() {
-    let payments = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/payments"))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&payments)
+async fn takes_an_order_through_the_saga_with_the_real_binary() {
+    let bus = accepting_bus().await;
+    let service = ServiceProcess::start(&bus.uri()).await;
+    let client = Client::new(&service);
+
+    let id = client.place_order().await;
+    assert_eq!(client.order(&id).await["status"], "PENDING");
+
+    assert_eq!(
+        client
+            .deliver(json!({ "type": "seat_reserved", "orderId": id }))
+            .await,
+        204
+    );
+    assert_eq!(client.order(&id).await["status"], "SEAT_RESERVED");
+
+    assert_eq!(
+        client
+            .deliver(json!({ "type": "payment_approved", "orderId": id, "paymentId": "p-1" }))
+            .await,
+        204
+    );
+    assert_eq!(client.order(&id).await["status"], "CONFIRMED");
+
+    assert_eq!(
+        published_types(&bus).await,
+        vec!["order_created", "order_confirmed"]
+    );
+}
+
+#[tokio::test]
+async fn cancels_the_order_when_payment_is_declined() {
+    let bus = accepting_bus().await;
+    let service = ServiceProcess::start(&bus.uri()).await;
+    let client = Client::new(&service);
+
+    let id = client.place_order().await;
+    client
+        .deliver(json!({ "type": "seat_reserved", "orderId": id }))
         .await;
-    let service = ServiceProcess::start(&payments.uri()).await;
+    client
+        .deliver(json!({ "type": "payment_declined", "orderId": id }))
+        .await;
+
+    assert_eq!(client.order(&id).await["status"], "CANCELLED");
+    assert_eq!(
+        published_types(&bus).await,
+        vec!["order_created", "order_cancelled"]
+    );
+}
+
+#[tokio::test]
+async fn returns_502_when_the_event_bus_is_failing() {
+    let bus = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/events"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&bus)
+        .await;
+    let service = ServiceProcess::start(&bus.uri()).await;
 
     let res = reqwest::Client::new()
         .post(format!("{}/orders", service.base))
@@ -141,24 +236,4 @@ async fn returns_502_when_the_payments_service_is_failing() {
         .unwrap();
 
     assert_eq!(res.status(), 502);
-}
-
-#[tokio::test]
-async fn returns_402_when_payment_is_declined() {
-    let payments = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/payments"))
-        .respond_with(ResponseTemplate::new(402).set_body_json(json!({ "status": "DECLINED" })))
-        .mount(&payments)
-        .await;
-    let service = ServiceProcess::start(&payments.uri()).await;
-
-    let res = reqwest::Client::new()
-        .post(format!("{}/orders", service.base))
-        .json(&book_order())
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(res.status(), 402);
 }

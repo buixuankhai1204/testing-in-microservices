@@ -1,8 +1,9 @@
-//! Orders service. Requests go http -> service -> domain, and the service calls out to the
-//! payments gateway and the repository.
+//! Orders service in an event-driven (choreography) setup. Requests go http -> service ->
+//! domain. The service only knows the repository and the event publisher; other services show
+//! up as events coming in over `POST /events`.
 
 pub mod domain;
-pub mod gateway;
+pub mod events;
 pub mod http;
 pub mod repository;
 pub mod service;

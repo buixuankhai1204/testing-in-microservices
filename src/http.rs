@@ -1,6 +1,9 @@
-//! HTTP routes plus the request/response types.
+//! HTTP routes plus the request/response types. `POST /events` is where the message bus pushes
+//! events from other services (seat_reserved and friends), so a 2xx there means "handled, don't
+//! redeliver".
 
 use crate::domain::{Item, Money, Order, OrderStatus};
+use crate::events::InboundEvent;
 use crate::service::{OrderService, ServiceError};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -17,6 +20,7 @@ pub fn router(service: Arc<OrderService>) -> Router {
         .route("/health", get(|| async { "ok" }))
         .route("/orders", post(create_order))
         .route("/orders/{id}", get(get_order))
+        .route("/events", post(receive_event))
         .with_state(service)
 }
 
@@ -80,13 +84,20 @@ async fn get_order(
     Ok(Json(OrderDto::from(&order)))
 }
 
+async fn receive_event(
+    State(svc): State<Arc<OrderService>>,
+    Json(event): Json<InboundEvent>,
+) -> Result<StatusCode, ServiceError> {
+    svc.handle(event).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 impl IntoResponse for ServiceError {
     fn into_response(self) -> Response {
         let status = match &self {
             ServiceError::EmptyOrder | ServiceError::Domain(_) => StatusCode::UNPROCESSABLE_ENTITY,
-            ServiceError::PaymentDeclined => StatusCode::PAYMENT_REQUIRED,
-            ServiceError::PaymentsUnavailable(_) => StatusCode::BAD_GATEWAY,
             ServiceError::NotFound(_) => StatusCode::NOT_FOUND,
+            ServiceError::Publish(_) => StatusCode::BAD_GATEWAY,
             ServiceError::Repo(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, Json(json!({ "error": self.to_string() }))).into_response()

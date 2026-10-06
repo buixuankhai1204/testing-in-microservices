@@ -60,6 +60,7 @@ fn sample_order(customer: &str) -> Order {
 async fn saves_and_loads_an_order_round_trip() {
     let db = start_db().await;
     let mut order = sample_order("c-42");
+    order.reserve_seat().unwrap();
     order.confirm("p-1").unwrap();
 
     db.repo.save(&order).await.unwrap();
@@ -75,6 +76,7 @@ async fn saves_and_loads_an_order_round_trip() {
 async fn save_is_an_upsert() {
     let db = start_db().await;
     let mut order = sample_order("c-42");
+    order.reserve_seat().unwrap();
     order.confirm("p-1").unwrap();
     db.repo.save(&order).await.unwrap();
 
