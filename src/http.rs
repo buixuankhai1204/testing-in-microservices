@@ -1,9 +1,7 @@
-//! HTTP routes plus the request/response types. `POST /events` is where the message bus pushes
-//! events from other services (seat_reserved and friends), so a 2xx there means "handled, don't
-//! redeliver".
+//! HTTP routes plus the request/response types. Events from other services don't come in here,
+//! they arrive on Kafka (see `kafka.rs`).
 
 use crate::domain::{Item, Money, Order, OrderStatus};
-use crate::events::InboundEvent;
 use crate::service::{OrderService, ServiceError};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -20,7 +18,6 @@ pub fn router(service: Arc<OrderService>) -> Router {
         .route("/health", get(|| async { "ok" }))
         .route("/orders", post(create_order))
         .route("/orders/{id}", get(get_order))
-        .route("/events", post(receive_event))
         .with_state(service)
 }
 
@@ -82,14 +79,6 @@ async fn get_order(
 ) -> Result<Json<OrderDto>, ServiceError> {
     let order = svc.get(id).await?;
     Ok(Json(OrderDto::from(&order)))
-}
-
-async fn receive_event(
-    State(svc): State<Arc<OrderService>>,
-    Json(event): Json<InboundEvent>,
-) -> Result<StatusCode, ServiceError> {
-    svc.handle(event).await?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 impl IntoResponse for ServiceError {

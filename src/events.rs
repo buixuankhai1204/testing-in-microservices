@@ -3,13 +3,15 @@
 //! `InboundEvent`s, and each service does its own part of the saga.
 //!
 //! Wire format is JSON with a snake_case `type` tag and camelCase fields. `EventPublisher` is
-//! the port the use cases see, `HttpEventPublisher` posts to the message bus over HTTP.
+//! the port the use cases see, `kafka::KafkaEventPublisher` is the real one.
 
 use crate::domain::{Item, Order};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 use uuid::Uuid;
+
+/// The `type` values we know how to handle. Anything else on a shared topic isn't ours.
+pub const INBOUND_TYPES: [&str; 3] = ["seat_reserved", "payment_approved", "payment_declined"];
 
 /// What we hear from other services.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -76,6 +78,14 @@ impl From<&Item> for ItemData {
 }
 
 impl OutboundEvent {
+    pub fn order_id(&self) -> Uuid {
+        match self {
+            OutboundEvent::OrderCreated { order_id, .. }
+            | OutboundEvent::OrderConfirmed { order_id }
+            | OutboundEvent::OrderCancelled { order_id } => *order_id,
+        }
+    }
+
     pub fn order_created(order: &Order) -> Self {
         OutboundEvent::OrderCreated {
             order_id: order.id(),
@@ -106,44 +116,4 @@ pub struct PublishError(pub String);
 #[async_trait]
 pub trait EventPublisher: Send + Sync {
     async fn publish(&self, event: OutboundEvent) -> Result<(), PublishError>;
-}
-
-/// Posts events as JSON to `{base_url}/events` on the message bus.
-pub struct HttpEventPublisher {
-    http: reqwest::Client,
-    url: String,
-}
-
-impl HttpEventPublisher {
-    pub fn new(base_url: impl Into<String>, timeout: Duration) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .expect("failed to build HTTP client");
-        HttpEventPublisher {
-            http,
-            url: format!("{}/events", base_url.into().trim_end_matches('/')),
-        }
-    }
-}
-
-#[async_trait]
-impl EventPublisher for HttpEventPublisher {
-    async fn publish(&self, event: OutboundEvent) -> Result<(), PublishError> {
-        let response = self
-            .http
-            .post(&self.url)
-            .json(&event)
-            .send()
-            .await
-            .map_err(|e| PublishError(e.to_string()))?;
-
-        if !response.status().is_success() {
-            return Err(PublishError(format!(
-                "bus answered HTTP {}",
-                response.status()
-            )));
-        }
-        Ok(())
-    }
 }
