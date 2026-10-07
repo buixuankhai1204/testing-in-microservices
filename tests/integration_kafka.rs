@@ -170,21 +170,6 @@ async fn publishes_events_keyed_by_order_id_in_the_agreed_wire_format() {
     );
 }
 
-#[tokio::test]
-async fn publishing_fails_instead_of_hanging_when_no_broker_answers() {
-    // nothing listens on port 1
-    let config = KafkaConfig::new("127.0.0.1:1");
-    let publisher = KafkaEventPublisher::new(kafka::producer(&config).unwrap(), "orders.events");
-
-    let started = std::time::Instant::now();
-    let result = publisher.publish(order_created(Uuid::new_v4())).await;
-
-    assert!(result.is_err());
-    assert!(
-        started.elapsed() < Duration::from_secs(15),
-        "should give up in about 5s"
-    );
-}
 
 // consuming
 

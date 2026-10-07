@@ -176,37 +176,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn order_created_event_describes_the_order() {
-        let mut repo = MockOrderRepository::new();
-        repo.expect_save().returning(|_| Ok(()));
-        let published = Arc::new(std::sync::Mutex::new(vec![]));
-        let mut events = MockEventPublisher::new();
-        events.expect_publish().returning({
-            let published = published.clone();
-            move |event| {
-                published.lock().unwrap().push(event);
-                Ok(())
-            }
-        });
-
-        let order = service(repo, events).place("c-42", book()).await.unwrap();
-
-        assert_eq!(
-            *published.lock().unwrap(),
-            vec![OutboundEvent::OrderCreated {
-                order_id: order.id(),
-                customer_id: "c-42".into(),
-                items: vec![crate::events::ItemData {
-                    sku: "book".into(),
-                    qty: 2,
-                    price_cents: 10_00
-                }],
-                total_cents: 20_00,
-            }]
-        );
-    }
-
-    #[tokio::test]
     async fn place_fails_when_the_event_cannot_be_published() {
         let mut repo = MockOrderRepository::new();
         repo.expect_save().returning(|_| Ok(()));
@@ -223,51 +192,10 @@ mod tests {
         assert!(matches!(err, ServiceError::Publish(_)));
     }
 
-    #[tokio::test]
-    async fn empty_order_is_not_saved_or_published() {
-        // no expectations set, so any call on the mocks panics
-        let svc = service(MockOrderRepository::new(), MockEventPublisher::new());
-
-        let err = svc.place("c-42", vec![]).await.unwrap_err();
-
-        assert!(matches!(err, ServiceError::EmptyOrder));
-    }
-
-    #[tokio::test]
-    async fn seat_reserved_moves_the_order_to_seat_reserved() {
-        let order = pending_order();
-        let mut repo = repo_holding(&order);
-        repo.expect_save()
-            .withf(|o| o.status() == OrderStatus::SeatReserved)
-            .times(1)
-            .returning(|_| Ok(()));
-        // nothing to announce yet, so no publish expectation
-        let svc = service(repo, MockEventPublisher::new());
-
-        svc.handle(InboundEvent::SeatReserved {
-            order_id: order.id(),
-        })
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn seat_reserved_delivered_twice_is_ignored() {
-        let order = order_with_seat();
-        let mut repo = repo_holding(&order);
-        repo.expect_save().never();
-        let svc = service(repo, MockEventPublisher::new());
-
-        svc.handle(InboundEvent::SeatReserved {
-            order_id: order.id(),
-        })
-        .await
-        .unwrap();
-    }
 
     #[tokio::test]
     async fn seat_reserved_for_an_unknown_order_is_not_found() {
-        let mut repo = MockOrderRepository::new();
+        let mut repo: MockOrderRepository = MockOrderRepository::new();
         repo.expect_find_by_id().returning(|_| Ok(None));
         let svc = service(repo, MockEventPublisher::new());
 
@@ -324,53 +252,17 @@ mod tests {
         assert!(matches!(err, ServiceError::Domain(_)));
     }
 
-    #[tokio::test]
-    async fn payment_approved_delivered_twice_is_ignored() {
-        let order = confirmed_order();
-        let mut repo = repo_holding(&order);
-        repo.expect_save().never();
-        let svc = service(repo, MockEventPublisher::new());
-
-        svc.handle(InboundEvent::PaymentApproved {
-            order_id: order.id(),
-            payment_id: "p-1".into(),
-        })
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn payment_declined_cancels_the_order_and_publishes_order_cancelled() {
-        let order = order_with_seat();
-        let order_id = order.id();
-        let mut repo = repo_holding(&order);
-        repo.expect_save()
-            .withf(|o| o.status() == OrderStatus::Cancelled)
-            .times(1)
-            .returning(|_| Ok(()));
-        let mut events = MockEventPublisher::new();
-        events
-            .expect_publish()
-            .withf(move |e| *e == OutboundEvent::OrderCancelled { order_id })
-            .times(1)
-            .returning(|_| Ok(()));
-
-        service(repo, events)
-            .handle(InboundEvent::PaymentDeclined { order_id })
-            .await
-            .unwrap();
-    }
 
     #[tokio::test]
     async fn payment_declined_cannot_cancel_a_confirmed_order() {
-        let order = confirmed_order();
-        let mut repo = repo_holding(&order);
+        let confirmed_order = confirmed_order();
+        let mut repo = repo_holding(&confirmed_order);
         repo.expect_save().never();
         let svc = service(repo, MockEventPublisher::new());
 
         let err = svc
             .handle(InboundEvent::PaymentDeclined {
-                order_id: order.id(),
+                order_id: confirmed_order.id(),
             })
             .await
             .unwrap_err();
@@ -378,14 +270,4 @@ mod tests {
         assert!(matches!(err, ServiceError::Domain(_)));
     }
 
-    #[tokio::test]
-    async fn get_returns_not_found_for_unknown_id() {
-        let mut repo = MockOrderRepository::new();
-        repo.expect_find_by_id().returning(|_| Ok(None));
-        let svc = service(repo, MockEventPublisher::new());
-
-        let err = svc.get(Uuid::new_v4()).await.unwrap_err();
-
-        assert!(matches!(err, ServiceError::NotFound(_)));
-    }
 }

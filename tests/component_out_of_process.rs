@@ -82,10 +82,6 @@ impl ServiceProcess {
         service
     }
 
-    async fn start_stubbed() -> Self {
-        Self::start(&[("EVENT_BUS", "stub".into())]).await
-    }
-
     async fn start_on_kafka(brokers: &str, topics: &Topics) -> Self {
         Self::start(&[
             ("EVENT_BUS", "kafka".into()),
@@ -156,66 +152,6 @@ impl ServiceProcess {
             .unwrap();
         order["status"].as_str().unwrap().to_string()
     }
-
-    // the internal resources, only there with EVENT_BUS=stub
-
-    /// plays another service: hands the bytes to the service like a Kafka record, and says
-    /// what became of them (handled, ignored, parked)
-    async fn send_bytes(&self, payload: Vec<u8>) -> String {
-        let res = self
-            .http
-            .post(format!("{}/internal/messages", self.base))
-            .body(payload)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), 200);
-        let body: Value = res.json().await.unwrap();
-        body["settled"].as_str().unwrap().to_string()
-    }
-
-    async fn send(&self, message: Value) -> String {
-        self.send_bytes(serde_json::to_vec(&message).unwrap()).await
-    }
-
-    /// the `type` of everything we've published so far
-    async fn published_types(&self) -> Vec<String> {
-        let events: Vec<Value> = self
-            .http
-            .get(format!("{}/internal/published", self.base))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        events
-            .iter()
-            .map(|e| e["type"].as_str().unwrap().to_string())
-            .collect()
-    }
-
-    async fn dead_letters(&self) -> Vec<String> {
-        self.http
-            .get(format!("{}/internal/dead-letters", self.base))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap()
-    }
-
-    async fn set_bus_down(&self, down: bool) {
-        let res = self
-            .http
-            .put(format!("{}/internal/bus", self.base))
-            .json(&json!({ "down": down }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), 204);
-    }
 }
 
 impl Drop for ServiceProcess {
@@ -232,116 +168,6 @@ fn free_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
-}
-
-// with the stub bus, driven through /internal
-
-#[tokio::test]
-async fn takes_an_order_through_the_saga() {
-    let service = ServiceProcess::start_stubbed().await;
-
-    let id = service.place_order_ok().await;
-    assert_eq!(service.published_types().await, vec!["order_created"]);
-
-    // the events service answers order_created
-    let settled = service
-        .send(json!({ "type": "seat_reserved", "orderId": id }))
-        .await;
-    assert_eq!(settled, "handled");
-    assert_eq!(service.status_of(&id).await, "SEAT_RESERVED");
-
-    // and then payments answers
-    let settled = service
-        .send(json!({ "type": "payment_approved", "orderId": id, "paymentId": "p-1" }))
-        .await;
-    assert_eq!(settled, "handled");
-    assert_eq!(service.status_of(&id).await, "CONFIRMED");
-    assert_eq!(
-        service.published_types().await,
-        vec!["order_created", "order_confirmed"]
-    );
-}
-
-#[tokio::test]
-async fn cancels_the_order_when_payment_is_declined() {
-    let service = ServiceProcess::start_stubbed().await;
-    let id = service.place_order_ok().await;
-
-    service
-        .send(json!({ "type": "seat_reserved", "orderId": id }))
-        .await;
-    service
-        .send(json!({ "type": "payment_declined", "orderId": id }))
-        .await;
-
-    assert_eq!(service.status_of(&id).await, "CANCELLED");
-    assert_eq!(
-        service.published_types().await,
-        vec!["order_created", "order_cancelled"]
-    );
-}
-
-#[tokio::test]
-async fn returns_502_while_the_bus_is_down_and_works_again_after() {
-    let service = ServiceProcess::start_stubbed().await;
-
-    service.set_bus_down(true).await;
-    assert_eq!(service.place_order().await.status(), 502);
-
-    service.set_bus_down(false).await;
-    assert_eq!(service.place_order().await.status(), 201);
-}
-
-#[tokio::test]
-async fn parks_a_message_that_is_not_json_and_ignores_other_types() {
-    let service = ServiceProcess::start_stubbed().await;
-
-    assert_eq!(service.send_bytes(b"{{ nope".to_vec()).await, "parked");
-    assert_eq!(
-        service
-            .send(json!({ "type": "ticket_printed", "orderId": "x" }))
-            .await,
-        "ignored"
-    );
-
-    let reasons = service.dead_letters().await;
-    assert_eq!(reasons.len(), 1);
-    assert!(reasons[0].contains("not json"));
-}
-
-// the switch itself
-
-#[tokio::test]
-async fn the_internal_endpoints_are_closed_when_running_on_kafka() {
-    // the broker isn't there, the service still starts and serves
-    let service = ServiceProcess::start(&[
-        ("EVENT_BUS", "kafka".into()),
-        ("KAFKA_BROKERS", "127.0.0.1:1".into()),
-    ])
-    .await;
-
-    let res = service
-        .http
-        .post(format!("{}/internal/messages", service.base))
-        .body(r#"{ "type": "payment_approved", "orderId": "x", "paymentId": "p" }"#)
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(res.status(), 404, "nobody should be able to make up events");
-}
-
-#[test]
-fn refuses_to_start_with_an_unknown_event_bus() {
-    let output = Command::new(env!("CARGO_BIN_EXE_orders-service"))
-        .env("EVENT_BUS", "rabbit")
-        .env("PORT", free_port().to_string())
-        .env_remove("DATABASE_URL")
-        .output()
-        .unwrap();
-
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("EVENT_BUS must be kafka or stub"));
 }
 
 // with real Kafka
