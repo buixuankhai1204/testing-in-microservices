@@ -1,33 +1,42 @@
+# orders-service: the five test types, in Rust
 
-## Where each test type lives
+A small Orders service (axum, sqlx, Kafka) with one example of each kind of test.
 
-| Type | File | What is real | What is faked |
+## Why
+
+Test types are easy to mix up when you only read about them. This repo is a small real service
+with each type written once, so you can see what each one runs for real, what it fakes, and
+how much it costs to run.
+
+## The five types
+
+| Type | Where | Real | Faked |
 |---|---|---|---|
-| Unit | `src/domain.rs`, `src/service.rs`, `src/inbox.rs`, `src/kafka.rs` (`#[cfg(test)]`) | the class under test | collaborators (mockall) |
-| Integration | `tests/integration_kafka.rs` | our Kafka producer and consumers, real broker (Testcontainers; needs Docker) | the other services (the test produces to their topics) |
-| Integration | `tests/integration_repository.rs` | repository + sqlx + real Postgres | nothing |
-| Component, in-process | `tests/component_in_process.rs` | whole service, real HTTP, `inbox` | `StubBus`, `StubDeadLetters`, in-memory repo; other services' messages are handed to `settle` by the test |
-| Component, out-of-process | `tests/component_out_of_process.rs` | the compiled binary as its own process | with `EVENT_BUS=stub`: the stubs, driven through `/internal`. With real Kafka (needs Docker): nothing but the other services |
-| Contract (consumer) | `tests/contract_consumer.rs` | the real event handling path | Pact messages; writes `pacts/*.json` |
+| Unit | `src/` (`#[cfg(test)]`) | the code under test | its collaborators (mockall) |
+| Integration | `tests/integration_repository.rs`, `tests/integration_kafka.rs` | our adapter plus a real Postgres / Kafka (Testcontainers) | nothing else |
+| Component, in-process | `tests/component_in_process.rs` | the whole service, real HTTP | Kafka (stub bus), in-memory repo |
+| Component, out-of-process | `tests/component_out_of_process.rs` | the compiled binary as its own process | the other services |
+| Contract | `tests/contract_consumer.rs` | our event handling | the other services, as Pact messages (writes `pacts/`) |
 | End-to-end | `tests/e2e.rs` | a deployed environment | nothing |
 
-## Running
+Rule of thumb: most tests at the bottom (fast, cheap), a few at the top (slow, but they prove
+the pieces fit). Edge cases go in unit and component tests, e2e only covers the main journeys.
+
+## How to run
 
 ```bash
-cargo test                                   # everything that needs no Docker or deployment
+cargo test                       # unit, in-process component, contract. No Docker needed.
+cargo test -- --ignored          # the ones that need Docker (Postgres, Kafka)
 
-# the tests that need Docker: Postgres (postgres:16-alpine) and Kafka (apache/kafka-native)
-cargo test -- --ignored
-# ...or just one of them
+# just one of them
 cargo test --test integration_repository -- --ignored
 cargo test --test integration_kafka --test component_out_of_process -- --ignored
-# ...or against a Kafka you already have
-TEST_KAFKA_BROKERS=127.0.0.1:9092 cargo test --test integration_kafka -- --ignored
 
-# End-to-end against a deployed environment
+# end-to-end, against a deployed environment
 E2E_BASE_URL=https://staging.example.com cargo test --test e2e -- --ignored
 ```
 
-Run the service itself with `KAFKA_BROKERS=... [DATABASE_URL=...] cargo run`
-(without `DATABASE_URL` it uses the in-memory repository). Building needs a C compiler and
-`make`, since `rdkafka` compiles librdkafka.
+Building needs a C compiler and `make`, because `rdkafka` compiles librdkafka.
+
+To run the service itself: `KAFKA_BROKERS=localhost:9092 cargo run`. Without `DATABASE_URL`
+it keeps orders in memory.
